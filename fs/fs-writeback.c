@@ -1113,13 +1113,6 @@ static void redirty_tail(struct inode *inode, struct bdi_writeback *wb)
 	spin_unlock(&inode->i_lock);
 }
 
-static void redirty_tail(struct inode *inode, struct bdi_writeback *wb)
-{
-	spin_lock(&inode->i_lock);
-	redirty_tail_locked(inode, wb);
-	spin_unlock(&inode->i_lock);
-}
-
 /*
  * requeue inode for re-scanning after bdi->b_io list is exhausted.
  */
@@ -1159,11 +1152,9 @@ static bool inode_dirtied_after(struct inode *inode, unsigned long t)
  * Move expired (dirtied before dirtied_before) dirty inodes from
  * @delaying_queue to @dispatch_queue.
  */
+			       struct list_head *dispatch_queue,static int move_expired_inodes(struct list_head *delaying_queue,
 			       struct list_head *dispatch_queue,
-			       int flags,
-			       struct wb_writeback_work *work)static int move_expired_inodes(struct list_head *delaying_queue,
-			       struct list_head *dispatch_queue,
-			       unsigned long dirtied_before)
+			       int flags, unsigned long dirtied_before)
 {
 	LIST_HEAD(tmp);
 	struct list_head *pos, *node;
@@ -1228,11 +1219,11 @@ static void queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
 
 	assert_spin_locked(&wb->list_lock);
 	list_splice_init(&wb->b_more_io, &wb->b_io);
-	moved = move_expired_inodes(&wb->b_dirty, &wb->b_io, dirtied_before);
+	moved = move_expired_inodes(&wb->b_dirty, &wb->b_io, 0, dirtied_before);
 	if (!work->for_sync)
 		time_expire_jif = jiffies - dirtytime_expire_interval * HZ;
 	moved += move_expired_inodes(&wb->b_dirty_time, &wb->b_io,
-				     time_expire_jif);
+				     EXPIRE_DIRTY_ATIME, time_expire_jif);
 	if (moved)
 		wb_io_lists_populated(wb);
 	trace_writeback_queue_io(wb, work, dirtied_before, moved);
@@ -1380,8 +1371,6 @@ __writeback_single_inode(struct inode *inode, struct writeback_control *wbc)
 	long nr_to_write = wbc->nr_to_write;
 	unsigned dirty;
 	int ret;
-	/* @fs.sec -- 62cf6bdd87a5c084b05e3bb9a11045a339d42a6b -- */
-	bool newly_dirty = false;
 
 	WARN_ON(!(inode->i_state & I_SYNC));
 
@@ -1410,14 +1399,18 @@ __writeback_single_inode(struct inode *inode, struct writeback_control *wbc)
 	spin_lock(&inode->i_lock);
 
 	dirty = inode->i_state & I_DIRTY;
-	if ((inode->i_state & I_DIRTY_TIME) &&
-	    ((dirty & (I_DIRTY_SYNC | I_DIRTY_DATASYNC)) ||
-	     wbc->sync_mode == WB_SYNC_ALL || wbc->for_sync ||
-	     time_after(jiffies, inode->dirtied_time_when +
-			dirtytime_expire_interval * HZ))) {
-		dirty |= I_DIRTY_TIME;
-		trace_writeback_lazytime(inode);
-	}
+	if (inode->i_state & I_DIRTY_TIME) {
+		if ((dirty & (I_DIRTY_SYNC | I_DIRTY_DATASYNC)) ||
+		    wbc->sync_mode == WB_SYNC_ALL ||
+		    unlikely(inode->i_state & I_DIRTY_TIME_EXPIRED) ||
+		    unlikely(time_after(jiffies,
+					(inode->dirtied_time_when +
+					 dirtytime_expire_interval * HZ)))) {
+			dirty |= I_DIRTY_TIME | I_DIRTY_TIME_EXPIRED;
+			trace_writeback_lazytime(inode);
+		}
+	} else
+		inode->i_state &= ~I_DIRTY_TIME_EXPIRED;
 	inode->i_state &= ~dirty;
 
 	/*
@@ -1434,12 +1427,10 @@ __writeback_single_inode(struct inode *inode, struct writeback_control *wbc)
 	smp_mb();
 
 	if (mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
-		newly_dirty = true;
+		inode->i_state |= I_DIRTY_PAGES;
 
 	spin_unlock(&inode->i_lock);
 
-	if (newly_dirty)
-		__mark_inode_dirty(inode, I_DIRTY_PAGES);
 	if (dirty & I_DIRTY_TIME)
 		mark_inode_dirty_sync(inode);
 	/* Don't write the inode if only I_DIRTY_PAGES was set */
@@ -1744,11 +1735,13 @@ static long writeback_inodes_wb(struct bdi_writeback *wb, long nr_pages,
 	};
 	struct blk_plug plug;
 
-	blk_start_plug(&plug);
+		spin_lock(&wb->list_lock);
+	if (list_empty(&wb->b_io))blk_start_plug(&plug);
 	spin_lock(&wb->list_lock);
 	if (list_empty(&wb->b_io))
 		queue_io(wb, &work, jiffies);
-	__writeback_inodes_wb(wb, &work);
+		spin_unlock(&wb->list_lock);
+	blk_finish_plug(&plug);__writeback_inodes_wb(wb, &work);
 	spin_unlock(&wb->list_lock);
 	blk_finish_plug(&plug);
 
@@ -1767,7 +1760,7 @@ static long writeback_inodes_wb(struct bdi_writeback *wb, long nr_pages,
  * takes longer than a dirty_writeback_interval interval, then leave a
  * one-second gap.
  *
- * dirtied_before takes precedence over nr_to_write.  So we'll only write back
+ *  * all dirty pages if they are all attached to "old" mappings.older_than_this takes precedence over nr_to_write.  So we'll only write back
  * all dirty pages if they are all attached to "old" mappings.
  */
 static long wb_writeback(struct bdi_writeback *wb,
@@ -2177,7 +2170,7 @@ void __mark_inode_dirty(struct inode *inode, int flags)
 	    (dirtytime && (inode->i_state & I_DIRTY_INODE)))
 		return;
 
-	if (unlikely(block_dump > 1))
+	if (unlikely(block_dump))
 		block_dump___mark_inode_dirty(inode);
 
 	spin_lock(&inode->i_lock);
