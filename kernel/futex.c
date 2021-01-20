@@ -894,7 +894,6 @@ static void put_pi_state(struct futex_pi_state *pi_state)
 		pi_state_update_owner(pi_state, NULL);
 		rt_mutex_proxy_unlock(&pi_state->pi_mutex);
 		raw_spin_unlock_irqrestore(&pi_state->pi_mutex.wait_lock, flags);
-
 	}
 
 	if (current->pi_state_cache) {
